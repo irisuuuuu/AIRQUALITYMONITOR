@@ -1,0 +1,598 @@
+# Ubuntu server command list
+
+Run these in an SSH terminal on the mini PC. The commands using `docker compose`
+start in the application folder:
+
+```bash
+cd ~/AirQualityMonitor
+```
+
+Use `sudo docker` as shown if your account is not in the Docker group. Docker
+already contains the Python packages needed by the web app and ingestion service.
+
+## Initial setup: choose GitHub or SCP
+
+These steps assume Ubuntu, Docker Engine, the Compose plugin, and SSH are already
+installed. Examples use `airqualitymonitor@192.168.xxx.xxx`; change that if the
+server's username or address changes. For a fresh setup, use a destination folder
+that has no existing database. An existing running server should use the update
+instructions below instead.
+
+**Do not transfer the laptop's `db_data/`.** PostgreSQL creates a new server-local
+directory and runs `schema.sql` automatically when it starts with an empty data
+directory. A fresh database has no readings and no dashboard accounts. Docker
+builds the application images on Ubuntu; you do not need to copy images, `.git/`,
+`.test-deps/`, or Python virtual environments.
+
+### Option A: clone from GitHub on Ubuntu
+
+Before using GitHub, check the laptop repository:
+
+```powershell
+cd C:\Users\Admin\Documents\AirQualityMonitor
+git ls-files -- db_data .env
+```
+
+There should be no output. If a checkout still tracks `db_data/`, clean its
+tracking before deployment. `.gitignore` does not stop tracking files
+that were already committed. See the [Git ignore documentation](https://git-scm.com/docs/gitignore).
+
+If `db_data/` is tracked, prepare a commit on the **laptop**, review it, then push:
+
+```powershell
+git rm -r --cached -- db_data
+git add .gitignore SERVER_COMMANDS.md
+git diff --cached --stat
+git commit -m "Stop tracking PostgreSQL runtime data and document server setup"
+git push
+```
+
+`--cached` removes files from Git's index while keeping the laptop's data on disk.
+This does not remove them from previous commits. See [Git rm documentation](https://git-scm.com/docs/git-rm).
+If `.env` is listed by the check, stop and remove it from tracking separately
+before deployment. Do not run these cleanup commands in a server's live database
+folder. Pulling a commit that deletes tracked database files can remove those
+files from another checkout.
+
+Once the GitHub branch is prepared, run on **Ubuntu**:
+
+```bash
+cd ~
+git clone https://github.com/jarichooo/AirQualityMonitor.git AirQualityMonitor
+cd ~/AirQualityMonitor
+git ls-files -- db_data .env
+```
+
+Do not start Docker if that last command lists files. Clone into a new directory;
+`git clone` will refuse an existing nonempty destination. For a private repo,
+configure GitHub SSH access or authenticate HTTPS with a token when prompted.
+Do not put a token directly into the repository URL.
+
+### Option B: copy source files with SCP from Windows
+
+Run in **PowerShell on the laptop**:
+
+```powershell
+cd C:\Users\Admin\Documents\AirQualityMonitor
+ssh airqualitymonitor@192.168.xxx.xxx "mkdir -p ~/AirQualityMonitor"
+scp -r .\ingestion .\web_app .\airqualitymonitor .\airqualitymonitor.ino `
+  .\docker-compose.yml .\schema.sql .\mosquitto.conf .\add_users.py `
+  .\simulate_esp32.py .\README.md .\FIRMWARE.md .\SERVER_COMMANDS.md .\.gitignore `
+  airqualitymonitor@192.168.xxx.xxx:~/AirQualityMonitor/
+```
+
+This explicit list excludes `db_data/` and `.env`. SCP does not read `.gitignore`,
+so do not copy the entire laptop folder with `scp -r .`.
+
+Then connect to **Ubuntu**:
+
+```powershell
+ssh airqualitymonitor@192.168.xxx.xxx
+```
+
+### Finish either setup method on Ubuntu
+
+Create a private session key on the server if `.env` does not already exist:
+
+```bash
+cd ~/AirQualityMonitor
+if [ ! -e .env ]; then
+  (umask 077; python3 -c "import secrets; print('FLASK_SECRET_KEY=' + secrets.token_hex(32))" > .env)
+fi
+chmod 600 .env
+grep -qE '^FLASK_SECRET_KEY=.+$' .env && echo "Session key configured"
+```
+
+The check displays no secret. If it prints nothing, configure a nonempty
+`FLASK_SECRET_KEY` before startup. Preserve an existing server key during updates.
+
+```bash
+sudo systemctl enable --now docker.service containerd.service
+sudo docker compose config --quiet
+sudo docker compose up -d --build
+sudo docker compose ps
+sudo docker compose exec web_dashboard python add_users.py admin
+```
+
+Enter and confirm the account password. Open `http://192.168.xxx.xxx:5000` on the
+laptop and log in. Account creation needs no rebuild. No host virtual environment
+is needed for Docker or account creation; it is only used for the simulator below.
+For the ESP32, configure the server's IP, port `1883`, and topic `poultry/sensors`.
+Use the hardware sketch and pin/library/verification steps in [FIRMWARE.md](FIRMWARE.md).
+Stop the Python simulator before collecting actual device readings.
+
+## Updating an existing server
+
+Keep the server's `.env` and `db_data/`. Updating this version does **not** require
+truncating tables, deleting database files, or recreating existing accounts.
+PostgreSQL initialization scripts run only on an empty database directory, so
+rebuilding containers alone does not apply the sensor column changes.
+
+### 1. Pull source changes (skip if already pulled)
+
+For a Git checkout whose database and secrets are not tracked, run:
+
+```bash
+cd ~/AirQualityMonitor
+git status --short
+git ls-files -- db_data .env
+```
+
+Resolve source changes first; the second command must list no files. Only then:
+
+```bash
+git pull --ff-only
+```
+
+Do not use this pull recipe on a live checkout that tracks `db_data/`. If you
+copied source by SCP instead, copy only changed source/configuration files and
+continue with step 2. Keep database files and `.env` on the server.
+
+### 2. Initialize the pulled changes on Ubuntu
+
+Stop any simulator with Ctrl+C and pause ESP32 publishers. Run this entire block
+in the Ubuntu SSH terminal, even if you already ran `git pull`. It backs up the
+database, applies the repeatable schema, then builds and starts updated services.
+The subshell stops on the first error; do not resume publishers until it succeeds:
+
+```bash
+(
+  set -eu
+  cd "$HOME/AirQualityMonitor"
+  sudo docker compose config --quiet
+  sudo docker compose stop ingestion web_dashboard
+  sudo docker compose up -d --wait postgres_db
+
+  mkdir -p "$HOME/airquality-backups"
+  chmod 700 "$HOME/airquality-backups"
+  backup_file="$HOME/airquality-backups/air_quality-$(date +%Y%m%d-%H%M%S).dump"
+  sudo docker exec -i postgres_db pg_dump -U admin -d air_quality -Fc -f /tmp/air_quality-update.dump
+  sudo docker exec -i postgres_db pg_restore --list /tmp/air_quality-update.dump > /dev/null
+  sudo docker cp postgres_db:/tmp/air_quality-update.dump "$backup_file"
+  chmod 600 "$backup_file"
+  echo "Backup saved: $backup_file"
+
+  sudo docker compose exec -T postgres_db psql -v ON_ERROR_STOP=1 -U admin -d air_quality < schema.sql
+  sudo docker compose up -d --build --wait
+)
+```
+
+If a command fails, fix the reported error before retrying the block. The schema
+is transactional and repeatable; `NOTICE: ... already exists, skipping` is normal.
+Do not delete `db_data/` to resolve an update error. Backup files include account
+password hashes and are private; the server's existing `.env` stays in place.
+
+### 3. Verify and resume collection
+
+After step 2 succeeds:
+
+```bash
+cd ~/AirQualityMonitor
+sudo docker compose ps
+sudo docker exec -it postgres_db psql -U admin -d air_quality -c "\d air_quality_logs"
+sudo docker exec -it postgres_db psql -U admin -d air_quality -c "SELECT COUNT(*) AS readings FROM air_quality_logs;"
+sudo docker exec -it postgres_db psql -U admin -d air_quality -c "SELECT username, role FROM dashboard_users ORDER BY username;"
+sudo docker compose logs --tail=50 ingestion web_dashboard
+```
+
+For moving real data to another server, use a PostgreSQL dump and restore, not a
+copy of a running `db_data/` directory.
+
+The sensor migration creates `mq4_ppm` (methane estimate) and `mq137_ppm`
+(ammonia estimate). Historical MQ raw values are preserved under `legacy_`
+column names, including `legacy_mq135_raw` and `legacy_mq137_raw`; the numbers
+are not converted or displayed as ppm. Previously mislabeled raw columns are
+also handled. Existing rows have NULL in the new ppm fields. The update keeps
+readings and accounts, adds missing PM1.0/PM10 fields, and can be applied again.
+Only continue after the dump above has been validated. Do not delete `db_data/`
+or truncate the table to perform this upgrade.
+The previous `nh3_ppm` retirement still drops that obsolete column if it exists;
+preserve its values in the verified backup before applying the schema.
+
+Update publishers and ingestion together: the live payload now uses
+`mq4_ppm`, `mq137_ppm`, `pm1`, `pm25`, and `pm10`. Old raw/ambiguous MQ keys are
+not accepted as concentration measurements. Flash the updated sketch after
+applying the schema and rebuilding containers, then Resume readings from the
+dashboard. MQ-4 uses borrowed RL/R0 values provisionally; calibrate the installed
+sensor before treating its ppm estimates as accurate methane concentrations.
+
+Open `http://192.168.0.110:5000` (substitute the current server IP) and log in with
+your existing account. Check dashboard analytics, the Data page, and CSV export.
+If this is a genuinely fresh database with no accounts, create one with:
+
+```bash
+sudo docker compose exec web_dashboard python add_users.py admin
+```
+
+Changes to `airqualitymonitor.ino` must also be compiled and uploaded to the
+ESP32 from Arduino IDE; Git pulls and Docker builds do not flash the device.
+Follow [FIRMWARE.md](FIRMWARE.md), confirm WiFi/server IP settings, then resume
+the ESP32 and verify its rows using the real-device query there. Keep the
+simulator stopped when collecting real sensor data.
+
+## Back up before maintenance
+
+Stop the simulator (Ctrl+C), pause devices, and stop database writers. Keep
+PostgreSQL running. Store backups outside the repository, with private permissions:
+
+```bash
+cd ~/AirQualityMonitor
+sudo docker compose stop ingestion web_dashboard
+mkdir -p ~/airquality-backups
+chmod 700 ~/airquality-backups
+backup_file="$HOME/airquality-backups/air_quality-$(date +%Y%m%d-%H%M%S).dump"
+sudo docker exec -i postgres_db pg_dump -U admin -d air_quality -Fc -f /tmp/air_quality-manual.dump
+sudo docker exec -i postgres_db pg_restore --list /tmp/air_quality-manual.dump > /dev/null
+sudo docker cp postgres_db:/tmp/air_quality-manual.dump "$backup_file"
+chmod 600 "$backup_file"
+```
+
+Continue only if `pg_dump` exits successfully. Validate the dump archive:
+
+```bash
+ls -lh "$backup_file"
+```
+
+The dump includes readings and account password hashes. Keep it private. These
+commands do not back up `.env`; preserve the server's existing `.env` separately.
+
+## Clear readings only (TRUNCATE)
+
+An admin can also use **Data > Delete all readings** and accept the confirmation
+popup. It performs the same truncate/reset operation below. Pause devices and
+simulators first if the table must stay empty; accounts remain unchanged.
+
+This permanently deletes sensor rows and resets their IDs, while keeping the
+schema and dashboard accounts. Back up first using the preceding section.
+**No container teardown or `db_data/` deletion is needed.** PostgreSQL's
+[TRUNCATE documentation](https://www.postgresql.org/docs/15/sql-truncate.html)
+describes `RESTART IDENTITY` and immediate space reclamation.
+
+```bash
+cd ~/AirQualityMonitor
+sudo docker compose stop ingestion web_dashboard
+sudo docker exec -it postgres_db psql -v ON_ERROR_STOP=1 -U admin -d air_quality -c "TRUNCATE TABLE air_quality_logs RESTART IDENTITY;"
+sudo docker exec -it postgres_db psql -U admin -d air_quality -c "SELECT COUNT(*) AS readings FROM air_quality_logs;"
+sudo docker exec -it postgres_db psql -U admin -d air_quality -c "SELECT username, role FROM dashboard_users ORDER BY username;"
+sudo docker compose up -d
+```
+
+The count should be zero while publishers are paused. Log in with your existing
+account; the dashboard shows its empty state and CSV export contains headers
+only. Resume devices or the simulator when ready; new readings start at ID 1.
+If you also pulled code changes, apply `schema.sql` and use `up -d --build` as
+described above before resuming publishers.
+
+## Full database reset (delete db_data)
+
+Use this only when you want a completely fresh database. **All readings and
+dashboard accounts will be lost.** Truncating first is redundant. Back up before
+resetting, pause publishers, and finish/review any Git source changes first.
+Ensure `git ls-files -- db_data .env` prints nothing before pulling.
+
+```bash
+cd ~/AirQualityMonitor
+git status --short
+git ls-files -- db_data .env
+git pull --ff-only
+```
+
+After a successful pull and backup, this block stops containers, checks the
+exact database directory, and removes only that directory. `.env` stays in place:
+
+```bash
+(
+  set -eu
+  cd "$HOME/AirQualityMonitor"
+  db_target="$(realpath -- db_data)"
+  expected_target="$(pwd -P)/db_data"
+  [ "$db_target" = "$expected_target" ] || { echo "Unexpected database path; stopping"; exit 1; }
+  [ -d "$db_target" ] || { echo "Database directory missing; stopping"; exit 1; }
+  sudo docker compose down
+  sudo rm -rf --one-file-system -- "$db_target"
+)
+```
+
+Never remove `db_data/` while PostgreSQL is running. Start the database first;
+its initialization runs the current `schema.sql` on the empty directory:
+
+```bash
+sudo docker compose up -d --wait postgres_db
+sudo docker compose logs --tail=50 postgres_db
+sudo docker exec -it postgres_db psql -U admin -d air_quality -c "\dt"
+sudo docker exec -it postgres_db psql -U admin -d air_quality -c "\d air_quality_logs"
+sudo docker compose up -d --build
+sudo docker compose exec web_dashboard python add_users.py admin
+sudo docker compose ps
+sudo docker compose logs --tail=50 ingestion web_dashboard
+```
+
+Both `air_quality_logs` and `dashboard_users` should exist. Recreate any viewer
+accounts too. Log out of old browser sessions and log in with the new account;
+keeping `.env` means existing session cookies can still be valid. Check empty
+analytics/CSV export, then resume publishers and verify new rows with the direct
+queries below. No host venv is needed for account creation.
+
+### Restore a backup if needed
+
+Keep publishers paused and stop ingestion/dashboard. Replace the example dump
+filename with the backup you actually saved. Restoring replaces current tables,
+including accounts; a dump from before this change contains the old column names:
+
+```bash
+cd ~/AirQualityMonitor
+sudo docker compose stop ingestion web_dashboard
+sudo docker compose up -d --wait postgres_db
+sudo docker compose exec -T postgres_db pg_restore -U admin -d air_quality --clean --if-exists --single-transaction < ~/airquality-backups/air_quality-YYYYMMDD-HHMMSS.dump
+sudo docker compose exec -T postgres_db psql -v ON_ERROR_STOP=1 -U admin -d air_quality < schema.sql
+sudo docker compose up -d --build
+sudo docker compose ps
+```
+
+Continue only on success; inspect columns and logs before resuming publishers.
+
+## Containers
+
+```bash
+sudo docker compose ps                       # See all four services
+sudo docker compose logs --tail=50 ingestion # Check received or failed readings
+sudo docker compose logs --tail=50 postgres_db
+sudo docker compose logs -f ingestion        # Follow logs; Ctrl+C leaves it running
+sudo docker compose up -d                    # Start existing containers
+sudo docker compose up -d --build            # Rebuild after copying changed code
+sudo docker compose restart web_dashboard    # Restart one existing container
+```
+
+The services are `postgres_db`, `mqtt_broker`, `ingestion`, and `web_dashboard`.
+Compose already sets `restart: unless-stopped` for each service.
+
+## Dashboard accounts
+
+The account script runs **inside the web container**. Do not activate the host
+virtual environment to use it. The password prompts do not echo what you type.
+
+```bash
+sudo docker compose exec web_dashboard python add_users.py admin
+sudo docker compose exec web_dashboard python add_users.py viewer --role viewer
+```
+
+The first command creates an administrator; the second creates a viewer. Use
+another username if desired. Both roles currently have the same read and CSV
+export access. An existing username is left unchanged, including its password.
+Creating an account writes to PostgreSQL immediately; it needs no rebuild.
+
+Equivalent direct Docker command (works from any directory):
+
+```bash
+sudo docker exec -it web_dashboard python /app/add_users.py admin
+```
+
+## Inspect PostgreSQL
+
+Open an interactive SQL prompt:
+
+```bash
+sudo docker compose exec postgres_db psql -U admin -d air_quality
+```
+
+At the `air_quality=#` prompt, try:
+
+```sql
+\dt
+\d air_quality_logs
+SELECT COUNT(*) FROM air_quality_logs;
+SELECT recorded_at, device_id, temperature_c, humidity_perc, co2_ppm,
+       pm1_ugm3, pm25_ugm3, pm10_ugm3, mq4_ppm, mq137_ppm
+FROM air_quality_logs ORDER BY recorded_at DESC LIMIT 10;
+SELECT username, role FROM dashboard_users ORDER BY username;
+SELECT COUNT(*) FROM air_quality_logs
+WHERE recorded_at >= now() - interval '24 hours';
+\q
+```
+
+Timestamps in the database are stored as UTC. To display recent times in the
+Philippines:
+
+```sql
+SELECT recorded_at AT TIME ZONE 'Asia/Manila' AS manila_time, device_id,
+       temperature_c FROM air_quality_logs ORDER BY recorded_at DESC LIMIT 10;
+```
+
+For a single query from the normal shell, use `-c`:
+
+```bash
+sudo docker compose exec -T postgres_db psql -U admin -d air_quality -c \
+  "SELECT COUNT(*) FROM air_quality_logs;"
+```
+
+Equivalent direct Docker command:
+
+```bash
+sudo docker exec -it postgres_db psql -U admin -d air_quality
+```
+
+### Direct, one-command database queries
+
+Run these from the Ubuntu shell, from any directory. Each command connects,
+prints a result, and exits; there is no `psql` prompt. These examples only
+read data.
+
+```bash
+# List tables and inspect their columns
+sudo docker exec -it postgres_db psql -U admin -d air_quality -c "\dt"
+sudo docker exec -it postgres_db psql -U admin -d air_quality -c "\d air_quality_logs"
+sudo docker exec -it postgres_db psql -U admin -d air_quality -c "\d dashboard_users"
+
+# Count all readings and list the 10 most recent
+sudo docker exec -it postgres_db psql -U admin -d air_quality -c "SELECT COUNT(*) AS total_readings FROM air_quality_logs;"
+sudo docker exec -it postgres_db psql -U admin -d air_quality -c "SELECT recorded_at, device_id, temperature_c, humidity_perc, co2_ppm, pm1_ugm3, pm25_ugm3, pm10_ugm3, mq4_ppm, mq137_ppm FROM air_quality_logs ORDER BY recorded_at DESC LIMIT 10;"
+
+# Recent activity and a 24-hour temperature summary
+sudo docker exec -it postgres_db psql -U admin -d air_quality -c "SELECT MAX(recorded_at) AS latest_reading FROM air_quality_logs;"
+sudo docker exec -it postgres_db psql -U admin -d air_quality -c "SELECT COUNT(*) AS readings_24h, ROUND(AVG(temperature_c)::numeric, 2) AS avg_temp_c FROM air_quality_logs WHERE recorded_at >= now() - interval '24 hours';"
+
+# Readings grouped by device; usernames and roles (no password hashes)
+sudo docker exec -it postgres_db psql -U admin -d air_quality -c "SELECT COALESCE(device_id, '(unspecified)') AS device, COUNT(*) AS readings FROM air_quality_logs GROUP BY device_id ORDER BY readings DESC;"
+sudo docker exec -it postgres_db psql -U admin -d air_quality -c "SELECT username, role FROM dashboard_users ORDER BY username;"
+
+# Show the latest timestamp in Philippine local time
+sudo docker exec -it postgres_db psql -U admin -d air_quality -c "SELECT recorded_at AT TIME ZONE 'Asia/Manila' AS manila_time, device_id, temperature_c FROM air_quality_logs ORDER BY recorded_at DESC LIMIT 10;"
+```
+
+## Host Python simulator
+
+The simulator runs in the **Ubuntu host's virtual environment**. It generates
+fake readings every five seconds.
+
+```bash
+cd ~/AirQualityMonitor
+~/henvironment-venv/bin/python simulate_esp32.py
+```
+
+Press Ctrl+C to stop it. If the environment has not been created yet:
+
+```bash
+python3 -m venv ~/henvironment-venv
+~/henvironment-venv/bin/pip install 'paho-mqtt>=2,<3'
+```
+
+The simulator stops when its terminal closes or the server loses power. It is
+separate from the four Compose services.
+
+## Optional Ollama + Qwen2.5 reasoning engine
+
+The Python script checks or installs **Ollama** and **`qwen2.5:3b`** on the Ubuntu
+host. It needs no Python packages or virtual environment. It runs separately from
+the four Docker services; no Docker rebuild or database reset is needed.
+The model comes from [Ollama's library](https://ollama.com/library/qwen2.5:3b) and
+downloads approximately 1.9 GB. Allow extra disk space for the engine and downloads.
+
+After pulling the script and empty thresholds file from GitHub:
+
+```bash
+cd ~/AirQualityMonitor
+sudo apt update
+sudo apt install -y python3 curl zstd
+python3 setup_reasoning_ai.py
+python3 setup_reasoning_ai.py --install
+python3 setup_reasoning_ai.py --smoke-test
+```
+
+The first check returns code 1 for missing components; proceed with `--install`.
+Continue after installation only if it succeeds. When Ollama is missing, the helper
+downloads and runs the official Linux installation script, which may request your
+sudo password. Run the Python helper as your normal user so project model files
+stay owned by your account. Installation needs internet. A broken installed engine
+is reported for repair rather than overwritten.
+
+`OLLAMA_MODELS` is set to the absolute project path `ai_model/reasoning ai/models/`.
+The script reuses complete project models and leaves other model stores untouched.
+Setup and smoke tests use a temporary local Ollama server and stop it afterward.
+The official installer may also create the normal system service on port 11434;
+that service has its own default model store, independent of this project's server.
+
+To check later without downloading or starting a server:
+
+```bash
+cd ~/AirQualityMonitor
+python3 setup_reasoning_ai.py
+```
+
+This checks the CLI and local manifest/blob sizes, without rehashing every blob.
+Ollama verifies downloads. `--smoke-test` also checks actual loading and generation.
+To repair a corrupted model, start the project's server below and run
+`OLLAMA_HOST=127.0.0.1:11435 ollama pull qwen2.5:3b` in another terminal.
+
+For manual testing, start the project's server:
+
+```bash
+cd ~/AirQualityMonitor
+python3 setup_reasoning_ai.py --serve
+```
+
+Keep the terminal open; Ctrl+C stops it. The API listens only at
+`http://127.0.0.1:11435`. In a second SSH terminal:
+
+```bash
+OLLAMA_HOST=127.0.0.1:11435 ollama list
+OLLAMA_HOST=127.0.0.1:11435 ollama run qwen2.5:3b
+```
+
+This project server is not started automatically on reboot. It supports the current
+installation/testing phase; later application integration needs a service setup.
+An Ollama service on port 11434 does not automatically serve these project files.
+
+Edit your initially empty thresholds file when ready:
+
+```bash
+nano "ai_model/reasoning ai/thresholds.md"
+```
+
+Existing contents are preserved. The file is reserved for thresholds and response
+guidance for all sensors. The later `.h5` model will predict readings two hours
+ahead, and Qwen will describe predictions using your rules. That integration is
+not part of this setup. The generic smoke test does not validate poultry guidance.
+On the 8 GB server, check memory with `free -h` and test response time before
+connecting inference to the application.
+
+For SCP, copy the script from **PowerShell on the laptop**, replacing the address:
+
+```powershell
+scp .\setup_reasoning_ai.py airqualitymonitor@192.168.xxx.xxx:~/AirQualityMonitor/
+```
+
+Then run the Ubuntu setup commands above. Installation creates an empty thresholds
+file only if missing. Download separately on each machine; do not copy Windows
+programs or environments to Ubuntu. Git ignores `ai_model/reasoning ai/models/`;
+commit the script and thresholds Markdown instead. Back up server-specific rules
+before replacing them through Git.
+
+If installation fails, read the error and check internet, free disk, and sudo
+access. Consult the official [Linux](https://docs.ollama.com/linux) or
+[Windows](https://docs.ollama.com/windows) installation instructions. If the newly
+installed CLI is not found, reopen the terminal. Normal checks and tests never
+upgrade an existing engine automatically.
+
+## Shut down or reboot the server
+
+If the host Python simulator is running, stop it with Ctrl+C. Leave the Compose
+containers running so their `unless-stopped` policy can start them again after
+the next boot. From the SSH session, shut down Ubuntu normally:
+
+```bash
+sudo systemctl poweroff
+```
+
+The SSH connection will close. Wait until the mini PC has fully powered off
+before unplugging it. For a planned restart instead, run `sudo systemctl reboot`.
+
+After powering it on and reconnecting with SSH, check the services:
+
+```bash
+cd ~/AirQualityMonitor
+sudo docker compose ps
+```
+
+If a service did not start, run `sudo docker compose up -d`. Do not run
+`docker compose stop` before a normal server shutdown: manually stopped
+containers using `unless-stopped` stay stopped on the next boot.
