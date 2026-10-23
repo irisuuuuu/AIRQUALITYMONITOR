@@ -1,0 +1,8 @@
+Publish one simulated reading through the same MQTT topic used by the ESP32:
+
+'{"device_id":"manual-test","ts":"2026-10-20T12:00:00+08:00","t":31.5,"h":68.0,"co2":420.0,"pm1":8.0,"pm25":15.2,"pm10":22.0,"mq4_ppm":850.0,"mq137_ppm":25.0}' | docker exec -i mqtt_broker mosquitto_pub -t "poultry/sensors" -s
+
+The ingestion service accepts `mq4_ppm` and `mq137_ppm`. It rejects the retired
+MQ135 and raw MQ keys so raw ADC values cannot be stored as ppm accidentally.
+This command contains simulated values; `airqualitymonitor.ino` is the real
+device firmware.
