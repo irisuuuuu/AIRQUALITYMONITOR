@@ -17,7 +17,7 @@ services:
       interval: 5s
       timeout: 5s
       retries: 12
-    restart: unless-stopped
+    restart: always
 
   # 2. The MQTT Broker Container
   mqtt_broker:
@@ -27,7 +27,7 @@ services:
       - "1883:1883"
     volumes:
       - ./mosquitto.conf:/mosquitto/config/mosquitto.conf
-    restart: unless-stopped
+    restart: always
 
   # 3. The Data Ingestion Container (Builds from your folder)
   ingestion:
@@ -38,7 +38,7 @@ services:
         condition: service_healthy
       mqtt_broker:
         condition: service_started
-    restart: unless-stopped
+    restart: always
 
   # 5. The Analytics Dashboard (Builds from your folder)
   web_dashboard:
@@ -53,4 +53,22 @@ services:
     depends_on:
       postgres_db:
         condition: service_healthy
-    restart: unless-stopped
+    restart: always
+
+  forecast_worker:
+    build:
+      context: ./ai_model
+    profiles: ["forecast"]
+    command: ["--manual"]
+    network_mode: host
+    environment:
+      DB_HOST: 127.0.0.1
+      DB_PORT: 5432
+      DB_NAME: air_quality
+      DB_USER: admin
+      DB_PASS: ${DB_PASS:-notsosecretpass}
+      OLLAMA_URL: http://127.0.0.1:11435
+    depends_on:
+      postgres_db:
+        condition: service_healthy
+    restart: always
