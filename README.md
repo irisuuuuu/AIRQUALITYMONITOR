@@ -4,6 +4,30 @@ Phase one of a poultry air quality monitoring application: prepare containers,
 sensor data collection, and a usable web interface. Real collection has not
 started; there is no predictive AI.
 
+## Methodology
+
+1. The [ESP32 firmware](airqualitymonitor.ino) samples connected sensors once per minute when collection is resumed; the optional [simulator](simulate_esp32.py) supplies synthetic development messages.
+2. MQTT carries readings through Mosquitto to the [Python ingestion service](ingestion/), which validates numeric values and timestamps before storing them using the [PostgreSQL schema](schema.sql).
+3. The [Flask web application](web_app/) provides authenticated access to live readings, descriptive charts, searchable history and CSV exports. WebSocket commands control the connected ESP32 separately from database ingestion.
+4. Firmware gas conversions use sensor-specific calibration constants. The MQ-4 constants remain provisional; calibration and end-to-end collection verification are required before interpreting estimates as measured concentrations.
+
+## Results and current status
+
+The repository implements the collection infrastructure, firmware controls, database ingestion and monitoring interface described below. Its documented checks cover routes, data validation, timestamp handling and recovery behavior with mocked database access. No field collection study, reference-gas accuracy measurement, uptime benchmark or prediction accuracy result is reported here.
+
+Real collection has not started according to the project status. Simulator values are test data. Predictive regression and dashboard AI integration remain planned; the optional Ollama setup verifies a separate runtime and does not produce sensor forecasts.
+
+## Source code, data and documentation
+
+- [Firmware](airqualitymonitor.ino), [ingestion](ingestion/), [web interface](web_app/) and [Docker Compose configuration](docker-compose.yml) contain the implementation.
+- Operational readings live in the local PostgreSQL database; use the authenticated CSV export for permitted sharing. The [simulator](simulate_esp32.py) can reproduce test inputs without presenting them as real measurements.
+- A database dump is present in the repository, but this README does not establish its provenance or redistribution permissions; it is not presented as a validated research dataset.
+- [Firmware guide](FIRMWARE.md), [server commands](SERVER_COMMANDS.md) and the setup and checks below explain configuration, backups and verification.
+
+## Topics
+
+`internet-of-things` · `esp32` · `mqtt` · `postgresql` · `flask` · `air-quality` · `environmental-monitoring`
+
 ## Hardware
 
 | Hardware | Specifications / role |
@@ -23,10 +47,19 @@ The ESP32 has these connected sensors and clock:
 | MH-Z19E | CO2 concentration in ppm. |
 | DS3231 | Real-time clock for measurement timestamps. |
 
-MQ readings are model-derived ppm estimates. MQ-4 temporarily uses the previous
-sensor's RL = 10 kOhm and R0 = 10.947 kOhm at the owner's request; this is a
-provisional calibration, not a validated methane measurement. See
-[FIRMWARE.md](FIRMWARE.md) for conversion constants, wiring, and Arduino libraries.
+MQ readings are model-derived ppm estimates. The collector in
+`airqualitymonitor/airqualitymonitor.ino` uses MQ4 RL=1 kOhm, default R0=0.945 kOhm,
+and `1000 * pow(Rs/R0, -2.95)`. MQ137 uses RL=47 kOhm, default R0=20 kOhm,
+and `pow(10, (log10(Rs/R0) - 0.42) / -0.263)`. These user-supplied defaults are
+provisional; actual load resistors and calibration remain unverified.
+
+The collector supports deliberate Serial calibration using known reference gas,
+saves R0 to NVS across restarts, and never calibrates automatically at boot.
+It retains small estimates without artificial floors or zeroing and flags
+out-of-range estimates in Serial diagnostics. See [FIRMWARE.md](FIRMWARE.md#mq-conversion-and-calibration)
+for `show`, `c4 <known ppm> stable` and `c137 <known ppm> stable` instructions.
+The tracked root sketch contains the same code. The older separate diagnostic
+uses different gas settings; use the collector's built-in commands instead.
 
 ## Data flow
 
@@ -38,7 +71,8 @@ dashboard can connect directly to the ESP32 over WebSocket for live sensor
 values and pause/resume collection; MQTT remains the path used to store readings
 in PostgreSQL. The ESP32 samples once per minute.
 The dashboard plots individual stored readings for the selected sensor over
-the last hour, alongside hourly averages for the last 24 hours. Select a sensor
+the latest recorded hour, alongside hourly averages across the entire stored
+date range. Historical imports therefore remain visible. Select a sensor
 card to change both graphs and use Refresh to load newly recorded data. Gaps
 longer than two minutes break the individual-reading line; devices have separate
 lines. Point tooltips and the expandable values table show measurement times
@@ -99,12 +133,21 @@ A fresh PostgreSQL directory runs `schema.sql` automatically. The website and
 ingestion wait for PostgreSQL readiness. Stored data remains in `db_data/`.
 Do not delete that directory to apply schema changes.
 
-To clear collected readings, an admin can click **Delete all readings** on the
-Data page and accept the confirmation popup. This clears the entire sensor
-table, including rows hidden by filters, and resets the next reading ID to 1.
-Accounts are kept. Export anything you need first, and pause the ESP32 and stop
-simulators if you want the table to remain empty. No container teardown or
-`db_data/` deletion is needed.
+For boot-time startup of the database, broker, ingestion, dashboard, prediction
+worker, and local advice service, follow [Automatic startup](SERVER_COMMANDS.md#automatic-startup).
+The five containers use `restart: always`; enable Docker and the existing project
+Ollama service once. Startup preserves stored data and does not run simulations.
+New predictions remain controlled by **Predict now**.
+
+An admin can use **Delete readings** on the Data page to delete from an inclusive
+UTC timestamp onward. The default scope is the four known simulation device IDs,
+so imported and physical-device rows are kept; selecting all devices also deletes
+their matching rows. Retained IDs are never renumbered. After a matching deletion,
+the next generated ID follows the highest retained ID (or starts at 1 if empty).
+The separate delete-all mode clears every reading and restarts at 1. Both modes
+ignore the table's display filters and keep accounts. Back up first and stop
+simulators, forecasting and collection before cleaning up. See the
+[simulation cleanup procedure](SERVER_COMMANDS.md#remove-readings-from-a-timestamp).
 
 Without a configured session secret, Flask generates an ephemeral secret and
 sessions become invalid after a restart. Database credentials still default to
@@ -128,8 +171,8 @@ Use one JSON object per MQTT message:
   together with ingestion. Invalid voltage/conversion results are omitted so
   PostgreSQL stores NULL, rather than a misleading negative concentration.
 - Firmware estimates sensor resistance from the measured ADC voltage and the
-  configured divider, load resistance, R0, and gas-specific curve. MQ-4's borrowed
-  calibration must be replaced after calibration of the installed module.
+  configured divider, load resistance, R0, and gas-specific curve. Verify MQ-4's
+  supplied calibration using the collector's Serial commands described in FIRMWARE.md.
 - Values must be finite numbers. Humidity is 0–100; gas and particulate
   readings cannot be negative. Booleans and numeric strings are rejected.
 - `device_id` is optional and at most 100 characters.
@@ -159,15 +202,25 @@ values. See [FIRMWARE.md](FIRMWARE.md) for pins, Arduino libraries, flashing, an
 verification on Ubuntu. `simulate_esp32.py` remains the optional test simulator;
 stop it before collecting real readings.
 
-## Planned predictive AI integration
+## Predictive AI and farm demonstrations
 
-The custom regression model will be saved as `.h5` in `ai_model/`. Its inference
-script will prepare collected readings as model inputs and retrieve predictions
-for readings **two hours ahead**. Input features, lookback window, preprocessing,
-target sensors, and model runtime must be confirmed from the trained model before
-inference is implemented. Measured data and predictions must remain separate.
-The dashboard already provides descriptive analytics and an unavailable forecast
-panel; it does not generate predictions or substitute simulated values.
+For the dashboard demo, choose `ai_model/simulate_good.py`, `simulate_mid.py`, or
+`simulate_bad.py`. Each seeds 120 readings for one condition, then keeps adding
+one reading per minute until you press **Ctrl+C**. Click **Predict now** on the dashboard to run the GRU and Qwen. The
+server blocks concurrent requests, repeated source readings, and requests less
+than 60 seconds apart. Follow the short [simulation guide](ai_model/SIMULATION_GUIDE.md).
+The forecast worker's Compose service waits for manual requests by default.
+
+The supplied GRU Joblib model uses 120 consecutive one-minute inputs to predict
+the next 120 minutes. The worker saves the final two-hour-ahead values, applies
+`ai_model/reasoning ai/thresholds.md`, and asks Qwen to explain them. The existing
+2-hour forecast panel displays numerical values and guidance separately.
+
+The simulators require no MQTT ingestion. Each launch deletes all sensor readings,
+forecasts, and prediction requests, then seeds the chosen condition with reading
+IDs starting at 1. User accounts are preserved. Forecast colours use saved model
+classifications rather than forcing the chosen input condition. For the
+step-by-step presentation, follow the [simulation demonstration guide](ai_model/SIMULATION_GUIDE.md).
 
 The root URL `/` opens the login page. Successful login redirects to `/dashboard`.
 Dashboard, Data, and export require authentication; existing sessions remain valid
@@ -201,9 +254,9 @@ found after installation, reopen PowerShell and retry. Ollama requires Windows
 
 Model manifests and blobs are stored under `ai_model/reasoning ai/models/` using
 `OLLAMA_MODELS`. Models installed elsewhere remain there; the script checks this
-project's store. `ai_model/reasoning ai/thresholds.md` starts empty and is preserved
-on subsequent runs. Add thresholds, units, poultry context, and response rules
-later. Downloaded model files are ignored by Git; the script and Markdown can be
+project's store. `ai_model/reasoning ai/thresholds.md` contains the project's
+general thresholds and response rules and is preserved on subsequent runs.
+Downloaded model files are ignored by Git; the script and Markdown can be
 committed.
 
 The default check is offline and makes no changes. It checks the CLI and local
@@ -227,16 +280,23 @@ $env:OLLAMA_HOST = '127.0.0.1:11435'
 ollama run qwen2.5:3b
 ```
 
-The intended later flow is collected readings -> custom `.h5` regression model ->
-readings predicted two hours ahead -> thresholds and Qwen -> explanatory sentences.
-This change installs and checks the runtime only. It does not yet interpret the
-thresholds, generate sensor assessments, or connect Qwen to the dashboard or
-regression model. Missing thresholds must not be replaced with invented limits.
+The forecast pipeline is collected PostgreSQL readings -> trained predictor ->
+readings predicted two hours ahead -> thresholds and Qwen -> dashboard numbers
+and explanatory sentences. The worker and webpage integration are prepared in
+[ai_model/README.md](ai_model/README.md). The supplied GRU Joblib artifact and its
+preprocessing are connected through `ai_model/predictor.py`, using pinned CPU
+dependencies and an optional Python 3.12 worker container. The worker prepares a
+120-minute input window from the latest reading in each UTC minute. It can
+interpolate internal gaps of up to two minutes, at most six minutes per window;
+longer gaps, insufficient coverage, stale readings, and invalid inputs block
+prediction. These estimates never change stored measurements. Their effect on
+forecast accuracy still needs validation with real device data.
 
 See [SERVER_COMMANDS.md](SERVER_COMMANDS.md#optional-ollama--qwen25-reasoning-engine)
-for Ubuntu, SCP, and troubleshooting instructions. No Docker rebuild or database
-migration is required. Test speed and available memory on the 8 GB server before
-connecting inference to the application.
+for Ubuntu, SCP, and troubleshooting instructions. Ollama setup alone needs no
+Docker rebuild or database migration. Enabling forecasts separately requires the
+additive forecast schema and dashboard rebuild described in the worker README.
+Test speed and available memory on the 8 GB server before running both models.
 
 ## Reliability boundaries
 
@@ -253,7 +313,8 @@ unattended collection.
 Dashboard analytics summarize stored rows and refresh manually. The separate
 WebSocket panel shows live ESP32 readings and confirmed collection status;
 a live broadcast does not prove that PostgreSQL stored the reading.
-There are no AI predictions. MQ concentration conversions are estimates and
+Forecasts require the trained model adapter and a running worker. They are
+predictions, separately labelled from measured readings. MQ concentration conversions are estimates and
 have not been validated against reference gas measurements; do not use them as
 certified gas alarms or mix the retired raw signals with ppm training features.
 The Flask development server is used locally; deployment hardening comes later.
@@ -263,12 +324,17 @@ The Flask development server is used locally; deployment hardening comes later.
 Install dependencies:
 `python -m pip install -r web_app/requirements.txt -r ingestion/requirements.txt`
 
+For the artifact checks, use the Python 3.12 forecast environment and install
+`ai_model/requirements.txt` as described in [ai_model/README.md](ai_model/README.md).
+The web/ingestion containers retain their existing dependency sets.
+
 Run:
 ```powershell
 python -m unittest discover -s web_app -p "test_*.py"
 python -m unittest discover -s ingestion -p "test_*.py"
 python firmware_gas_math_test.py
 python -m unittest test_setup_reasoning_ai.py
+python -m unittest discover -s ai_model -t . -p "test_*.py"
 docker compose config --quiet
 ```
 
