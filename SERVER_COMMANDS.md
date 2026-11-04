@@ -256,10 +256,37 @@ ls -lh "$backup_file"
 The dump includes readings and account password hashes. Keep it private. These
 commands do not back up `.env`; preserve the server's existing `.env` separately.
 
+## Remove readings from a timestamp
+
+An admin can use **Data > Delete readings** to select an inclusive start timestamp
+in **UTC**. Choose the simulated-readings scope to remove only rows from
+`sim-farm-good`, `sim-farm-mid`, `sim-farm-bad`, and `python-simulator`. Imported
+dataset and physical-device rows remain untouched under that scope. The all-device
+scope removes every matching row from the chosen timestamp onward, regardless of
+the Data page's display filters.
+
+Back up first using the maintenance procedure above. Stop the simulator with
+Ctrl+C, pause devices, and stop ingestion and the regular forecast worker before
+deleting. A worker holding the forecasting lock causes the operation to be refused;
+stopping it also prevents a later cycle from immediately adding demo readings again.
+
+The simulator seeds 119 minutes before its current minute, so use the earliest
+simulation reading's timestamp rather than the time you launched the script.
+Existing IDs remain unchanged. After deleting matching rows, the next generated ID
+is `MAX(remaining id) + 1`, or 1 if no readings remain. For example, a remaining
+maximum of 32,321 gives the next insert ID 32,322. Gaps inside the retained records
+are not filled. A no-match deletion does not change the sequence.
+
+Forecasts for affected devices are removed in the same transaction. Accounts and
+unaffected devices' forecasts remain. The ID sequence restart is transactional:
+if cleanup fails, the deletion and restart roll back together. See PostgreSQL's
+[ALTER SEQUENCE documentation](https://www.postgresql.org/docs/15/sql-altersequence.html).
+
 ## Clear readings only (TRUNCATE)
 
-An admin can also use **Data > Delete all readings** and accept the confirmation
-popup. It performs the same truncate/reset operation below. Pause devices and
+An admin can also use **Data > Delete readings**, choose the delete-all mode, and
+accept the confirmation popup. It performs the same truncate/reset operation below.
+Pause devices and
 simulators first if the table must stay empty; accounts remain unchanged.
 
 This permanently deletes sensor rows and resets their IDs, while keeping the
@@ -364,7 +391,22 @@ sudo docker compose restart web_dashboard    # Restart one existing container
 ```
 
 The services are `postgres_db`, `mqtt_broker`, `ingestion`, and `web_dashboard`.
-Compose already sets `restart: unless-stopped` for each service.
+Compose sets `restart: always` for each service. A manually stopped service stays
+stopped until you start it or Docker restarts, including after a server reboot.
+
+## Good, warning and critical farm demo
+
+For a demonstration without the sensor device, choose `ai_model/simulate_good.py`,
+`ai_model/simulate_mid.py`, or `ai_model/simulate_bad.py`. Each seeds 120 rows for
+its condition, then keeps adding one row per minute until you press **Ctrl+C**.
+It supplies readings only: click **Predict now** on the dashboard to run the
+trained model and Qwen. The service allows one request at a time, requires a new
+reading, and uses a 60-second cooldown.
+
+Follow the [step-by-step simulation demonstration guide](ai_model/SIMULATION_GUIDE.md).
+Each script deletes all existing sensor readings, forecasts, and prediction
+requests before seeding its condition. User accounts stay intact. The older `simulate_esp32.py`
+below tests MQTT ingestion and does not provide the model's required history.
 
 ## Dashboard accounts
 
@@ -464,20 +506,27 @@ sudo docker exec -it postgres_db psql -U admin -d air_quality -c "SELECT recorde
 The simulator runs in the **Ubuntu host's virtual environment**. It generates
 fake readings every five seconds.
 
+First-time setup (also fixes `ModuleNotFoundError: No module named 'paho'`):
+
+```bash
+sudo apt install -y python3-venv
+python3 -m venv ~/henvironment-venv
+~/henvironment-venv/bin/python -m pip install 'paho-mqtt>=2,<3'
+```
+
+Start the containers, then run the simulator:
+
 ```bash
 cd ~/AirQualityMonitor
-~/henvironment-venv/bin/python simulate_esp32.py
+sudo docker compose up -d
+~/henvironment-venv/bin/python ~/AirQualityMonitor/simulate_esp32.py
 ```
 
-Press Ctrl+C to stop it. If the environment has not been created yet:
-
-```bash
-python3 -m venv ~/henvironment-venv
-~/henvironment-venv/bin/pip install 'paho-mqtt>=2,<3'
-```
-
-The simulator stops when its terminal closes or the server loses power. It is
-separate from the four Compose services.
+For later runs, use the same simulator command; no environment activation or
+container rebuild is needed. Press **Ctrl+C** to stop it. Stop the simulator before
+collecting real sensor data so fake readings do not mix with device readings.
+The simulator stops when its terminal closes or the server loses power. It runs
+separately from the four Compose services.
 
 ## Optional Ollama + Qwen2.5 reasoning engine
 
@@ -538,20 +587,82 @@ OLLAMA_HOST=127.0.0.1:11435 ollama list
 OLLAMA_HOST=127.0.0.1:11435 ollama run qwen2.5:3b
 ```
 
-This project server is not started automatically on reboot. It supports the current
-installation/testing phase; later application integration needs a service setup.
-An Ollama service on port 11434 does not automatically serve these project files.
+The foreground command stops when its process is stopped. For automatic startup
+and a simulation that needs only one terminal, use the service below. An Ollama
+service on port 11434 does not automatically serve these project files.
 
-Edit your initially empty thresholds file when ready:
+### Keep project Qwen running in the background
+
+The supplied `ai_model/henvironment-ollama.service` targets the current Ubuntu
+installation: user `airqualitymonitor` and repository
+`/home/airqualitymonitor/AirQualityMonitor`. Edit those paths/account in the unit
+before installing if this installation differs. It runs the existing Python
+helper, which sets the project model store, loopback port 11435 and local-only
+model operation. It does not start a simulation, ingestion, or the forecast worker,
+and does not change database records.
+
+After committing/pushing and pulling the unit file, stop any foreground
+`python3 setup_reasoning_ai.py --serve` with Ctrl+C. Then run on Ubuntu:
+
+```bash
+(
+  set -eu
+  cd ~/AirQualityMonitor
+  python3 setup_reasoning_ai.py
+  sudo install -m 644 ai_model/henvironment-ollama.service /etc/systemd/system/henvironment-ollama.service
+  sudo systemd-analyze verify /etc/systemd/system/henvironment-ollama.service
+  sudo systemctl daemon-reload
+  sudo systemctl enable henvironment-ollama.service
+  sudo systemctl restart henvironment-ollama.service
+  sudo systemctl --no-pager status henvironment-ollama.service
+  curl --retry 15 --retry-connrefused --retry-delay 2 -fsS http://127.0.0.1:11435/api/tags | python3 -m json.tool
+)
+```
+
+The initial Python check must succeed; if it reports a missing engine/model,
+install it using the earlier instructions first. The tags response should list
+`qwen2.5:3b`. This endpoint check verifies discovery, not successful generation;
+the simulation will perform actual guidance requests. If port 11435 is already
+occupied, identify and stop the earlier project server before retrying this
+service. The normal Ollama service on 11434 can remain as it is.
+
+The service starts at boot and runs independently of SSH. It restarts after a
+process failure, subject to systemd's normal restart limits. You now need only
+the simulation command in your SSH terminal; do not also run `--serve` manually.
+Qwen may still need time to load on the first guidance request. This follows the
+[Ollama Linux service guidance](https://docs.ollama.com/linux) and
+[systemd service configuration](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html).
+
+To inspect or manage this project service:
+
+```bash
+sudo systemctl --no-pager status henvironment-ollama.service
+sudo journalctl -u henvironment-ollama.service -n 50 --no-pager
+sudo systemctl restart henvironment-ollama.service
+```
+
+Stopping a simulation with Ctrl+C leaves Qwen running. To stop it and disable
+automatic startup deliberately:
+
+```bash
+sudo systemctl disable --now henvironment-ollama.service
+```
+
+After changing the service unit, reinstall it and repeat `daemon-reload` and
+`restart`; after changing only the Python helper, restart the service. No Docker
+rebuild or database migration is needed to install this host service.
+
+Review the project's general thresholds when needed:
 
 ```bash
 nano "ai_model/reasoning ai/thresholds.md"
 ```
 
-Existing contents are preserved. The file is reserved for thresholds and response
-guidance for all sensors. The later `.h5` model will predict readings two hours
-ahead, and Qwen will describe predictions using your rules. That integration is
-not part of this setup. The generic smoke test does not validate poultry guidance.
+Existing contents are preserved. The file supplies thresholds and response
+guidance for all sensors. The forecast worker reads it for classification and
+Qwen context; follow [ai_model/README.md](ai_model/README.md) for the separate
+forecast schema, trained-model adapter and dashboard integration. The generic
+Ollama smoke test does not validate poultry guidance.
 On the 8 GB server, check memory with `free -h` and test response time before
 connecting inference to the application.
 
@@ -573,11 +684,49 @@ access. Consult the official [Linux](https://docs.ollama.com/linux) or
 installed CLI is not found, reopen the terminal. Normal checks and tests never
 upgrade an existing engine automatically.
 
+## Automatic startup
+
+On the already configured server, stop any simulation with **Ctrl+C** and wait
+for the current prediction to finish. After pulling the updated Compose file,
+run this once:
+
+```bash
+(
+  set -e
+  cd ~/AirQualityMonitor
+  python3 setup_reasoning_ai.py
+  sudo systemctl enable --now docker.service containerd.service henvironment-ollama.service
+  sudo docker compose --profile forecast up -d --wait \
+    postgres_db mqtt_broker ingestion web_dashboard forecast_worker
+  sudo systemctl is-enabled docker.service henvironment-ollama.service
+  sudo docker compose --profile forecast ps
+)
+```
+
+This uses the existing images and project Ollama service installed above. Docker
+starts the database, MQTT broker, sensor ingestion, dashboard, and prediction
+worker after boot; systemd starts Ollama. The `always` restart policy also brings
+back containers that were manually stopped before reboot. It follows
+[Docker's restart-policy behavior](https://docs.docker.com/engine/containers/start-containers-automatically/).
+
+Startup preserves database records and accounts. It never starts a simulation
+or seeds readings. New predictions still require **Predict now**; an unfinished
+request saved before shutdown may resume. Models and container images must
+already be installed; boot does not build, update, or download them.
+
+After reboot, ingestion is running again. Before a database-only demonstration,
+use the simulation guide's background-service block to pause ingestion first.
+If the ESP32 also restarts, its firmware starts paused: connect to it from the
+dashboard and resume collection. Server startup does not unpause the device or
+validate its timestamp compatibility with the forecast model.
+
+If you remove containers with `docker compose down`, recreate them with the
+startup block before expecting them to return after reboot.
+
 ## Shut down or reboot the server
 
-If the host Python simulator is running, stop it with Ctrl+C. Leave the Compose
-containers running so their `unless-stopped` policy can start them again after
-the next boot. From the SSH session, shut down Ubuntu normally:
+If the host Python simulator is running, stop it with Ctrl+C. Once automatic
+startup is configured above, shut down Ubuntu normally:
 
 ```bash
 sudo systemctl poweroff
@@ -590,9 +739,10 @@ After powering it on and reconnecting with SSH, check the services:
 
 ```bash
 cd ~/AirQualityMonitor
-sudo docker compose ps
+sudo docker compose --profile forecast ps
+sudo systemctl is-active docker.service henvironment-ollama.service
 ```
 
-If a service did not start, run `sudo docker compose up -d`. Do not run
-`docker compose stop` before a normal server shutdown: manually stopped
-containers using `unless-stopped` stay stopped on the next boot.
+If a container did not start, run `sudo docker compose --profile forecast up -d --wait`.
+For a project Ollama failure, inspect
+`sudo journalctl -u henvironment-ollama.service -n 50 --no-pager`.
