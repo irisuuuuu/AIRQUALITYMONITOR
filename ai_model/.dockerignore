@@ -1,0 +1,17 @@
+*
+!Dockerfile
+!.dockerignore
+!requirements.txt
+!__init__.py
+!forecast_worker.py
+!policy.py
+!predictor.py
+!predict.py
+!simulation.py
+!simulate_good.py
+!simulate_mid.py
+!simulate_bad.py
+!schema.sql
+!microclimate_forecaster.joblib
+!reasoning ai/
+!reasoning ai/thresholds.md
